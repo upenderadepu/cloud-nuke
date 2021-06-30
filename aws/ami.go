@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/gruntwork-io/cloud-nuke/logging"
-	"github.com/gruntwork-io/gruntwork-cli/errors"
+	"github.com/gruntwork-io/go-commons/errors"
 )
 
 // Returns a formatted string of AMI Image ids
@@ -50,6 +50,7 @@ func nukeAllAMIs(session *session.Session, imageIds []*string) error {
 
 	logging.Logger.Infof("Deleting all AMIs in region %s", *session.Config.Region)
 
+	deletedCount := 0
 	for _, imageID := range imageIds {
 		params := &ec2.DeregisterImageInput{
 			ImageId: imageID,
@@ -59,10 +60,11 @@ func nukeAllAMIs(session *session.Session, imageIds []*string) error {
 		if err != nil {
 			logging.Logger.Errorf("[Failed] %s", err)
 		} else {
+			deletedCount++
 			logging.Logger.Infof("Deleted AMI: %s", *imageID)
 		}
 	}
 
-	logging.Logger.Infof("[OK] %d AMI(s) terminated in %s", len(imageIds), *session.Config.Region)
+	logging.Logger.Infof("[OK] %d AMI(s) terminated in %s", deletedCount, *session.Config.Region)
 	return nil
 }

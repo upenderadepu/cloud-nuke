@@ -10,6 +10,7 @@ The currently supported functionality includes:
 
 - Deleting all Auto scaling groups in an AWS account
 - Deleting all Elastic Load Balancers (Classic and V2) in an AWS account
+- Deleting all Transit Gateways in an AWS account
 - Deleting all EBS Volumes in an AWS account
 - Deleting all unprotected EC2 instances in an AWS account
 - Deleting all AMIs in an AWS account
@@ -21,8 +22,12 @@ The currently supported functionality includes:
 - Deleting all EKS clusters in an AWS account
 - Deleting all RDS DB instances in an AWS account
 - Deleting all Lambda Functions in an AWS account
+- Deleting all SQS queues in an AWS account
 - Deleting all S3 buckets in an AWS account - except for buckets tagged with Key=cloud-nuke-excluded Value=true
 - Deleting all default VPCs in an AWS account
+- Deleting all IAM users in an AWS account
+- Deleting all Secrets Manager Secrets in an AWS account
+- Deleting all NAT Gateways in an AWS account
 - Revoking the default rules in the un-deletable default security group of a VPC
 
 ### BEWARE!
@@ -44,7 +49,7 @@ When executed as `cloud-nuke defaults-aws`, this tool deletes all DEFAULT VPCs a
 
 Note that package managers are third party. The third party cloud-nuke packages may not be updated with the latest version, but are often close. Please check your version against the latest available on the [releases page](https://github.com/gruntwork-io/cloud-nuke/releases). If you want the latest version, the recommended installation option is to [download from the releases page](https://github.com/gruntwork-io/cloud-nuke/releases).
 
-- **macOS:** You can install cloud-nuke using [Homebrew](https://brew.sh/): `brew install cloud-nuke`. 
+- **macOS:** You can install cloud-nuke using [Homebrew](https://brew.sh/): `brew install cloud-nuke`.
 
 - **Linux:** Most Linux users can use [Homebrew](https://docs.brew.sh/Homebrew-on-Linux): `brew install cloud-nuke`.
 
@@ -131,7 +136,25 @@ cloud-nuke aws --resource-type ec2 --dry-run
 
 For more granularity, such as being able to specify which resources to terminate using regular expressions or plain text, you can pass in a configuration file.
 
-_Note: Config file support is a new feature and only filtering s3 buckets by name using regular expressions is currently supported. We'll be adding more support in the future, and pull requests are welcome!_
+_Note: Config file support is a new feature and only filtering a handful of resources by name using regular expressions is currently supported. We'll be adding more support in the future, and pull requests are welcome!_
+
+The following resources support the Config file:
+
+- S3 Buckets
+    - Resource type: `s3`
+    - Config key: `s3`
+- IAM Users
+    - Resource type: `iam`
+    - Config key: `IAMUsers`
+- Secrets Manager Secrets
+    - Resource type: `secretsmanager`
+    - Config key: `SecretsManager`
+- NAT Gateways
+    - Resource type: `nat-gateway`
+    - Config key: `NATGateway`
+
+
+#### Example
 
 ```shell
 cloud-nuke aws --resource-type s3 --config path/to/file.yaml
@@ -148,7 +171,18 @@ s3:
       - .*-prod-alb-.*
 ```
 
+Similarly, you can adjust the config to delete only IAM users of a particular name by using the `IAMUsers` key. For
+example, in the following config, only IAM users that have the prefix `my-test-user-` in their username will be deleted.
+
+```
+IAMUsers:
+  include:
+    names_regex:
+      - ^my-test-user-.*
+```
+
 #### Include and exclude together
+
 Now consider the following contrived example:
 
 ```yaml
@@ -190,6 +224,7 @@ s3:
 ```
 -->
 
+
 #### CLI options override config file options
 
 The options provided in the command line take precedence over those provided in any config file that gets passed in. For example, say you provide `--resource-type s3` in the command line, along with a config file that specifies `ec2:` at the top level but doesn't specify `s3:`. The command line argument filters the resource types to include only s3, so the rules in the config file for `ec2:` are ignored, and ec2 resources are not nuked. All s3 resources would be nuked.
@@ -202,23 +237,17 @@ Be careful when nuking and append the `--dry-run` option if you're unsure. Even 
 
 To find out what we options are supported in the config file today, consult this table. Resource types at the top level of the file that are supported are listed here.
 
-| resource type | support |
-|---------------|---------|
-| s3            | partial |
-| ec2 instance  | none    |
-| iam role      | none    |
-| ... (more to come) | none |
+| resource type      | names | names_regex | tags | tags_regex |
+|--------------------|-------|-------------|------|------------|
+| s3                 | none  | ✅          | none | none       |
+| iam                | none  | ✅          | none | none       |
+| secretsmanager     | none  | ✅          | none | none       |
+| nat-gateway        | none  | ✅          | none | none       |
+| ec2 instance       | none  | none        | none | none       |
+| iam role           | none  | none        | none | none       |
+| ... (more to come) | none  | none        | none | none       |
 
 
-##### s3 resource type:
-_Note: the fields without `_regex` suffixes refer to support for plain-text matching against those fields._
-
-| field       | include | exclude |
-|-------------|---------|---------|
-| names       | none    | none    |
-| names_regex | ✅      | ✅      |
-| tags        | none    | none    |
-| tags_regex  | none    | none    |
 
 ### Log level
 

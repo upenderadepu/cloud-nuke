@@ -3,7 +3,7 @@ package aws
 import (
 	awsgo "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/gruntwork-io/gruntwork-cli/errors"
+	"github.com/gruntwork-io/go-commons/errors"
 )
 
 type DBInstances struct {
@@ -33,7 +33,7 @@ func (instance DBInstances) Nuke(session *session.Session, identifiers []string)
 	return nil
 }
 
-type RdsDeleteError struct{
+type RdsDeleteError struct {
 	name string
 }
 

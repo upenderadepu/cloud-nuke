@@ -11,7 +11,7 @@ import (
 
 	"github.com/gruntwork-io/cloud-nuke/logging"
 	"github.com/gruntwork-io/cloud-nuke/util"
-	"github.com/gruntwork-io/gruntwork-cli/errors"
+	"github.com/gruntwork-io/go-commons/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -73,7 +73,7 @@ func TestNukeRDSInstance(t *testing.T) {
 	)
 
 	rdsName := "cloud-nuke-test-" + util.UniqueID()
-	excludeAfter := time.Now().Add(1*time.Hour)
+	excludeAfter := time.Now().Add(1 * time.Hour)
 
 	createTestRDSInstance(t, session, rdsName)
 

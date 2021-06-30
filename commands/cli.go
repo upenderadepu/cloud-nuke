@@ -9,9 +9,9 @@ import (
 	"github.com/gruntwork-io/cloud-nuke/aws"
 	"github.com/gruntwork-io/cloud-nuke/config"
 	"github.com/gruntwork-io/cloud-nuke/logging"
-	"github.com/gruntwork-io/gruntwork-cli/collections"
-	"github.com/gruntwork-io/gruntwork-cli/errors"
-	"github.com/gruntwork-io/gruntwork-cli/shell"
+	"github.com/gruntwork-io/go-commons/collections"
+	"github.com/gruntwork-io/go-commons/errors"
+	"github.com/gruntwork-io/go-commons/shell"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -201,6 +201,9 @@ func awsNuke(c *cli.Context) error {
 	if err != nil {
 		return errors.WithStackTrace(err)
 	}
+
+	// global is a fake region, used to represent global resources
+	regions = append(regions, aws.GlobalRegion)
 
 	selectedRegions := c.StringSlice("region")
 	excludedRegions := c.StringSlice("exclude-region")
