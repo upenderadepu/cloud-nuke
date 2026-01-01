@@ -31,6 +31,7 @@ type BaseAwsResource struct {
 
 func (br *BaseAwsResource) Init(cfg aws.Config) {
 	br.Nukables = make(map[string]error)
+	br.Timeout = DefaultWaitTimeout
 }
 
 func (br *BaseAwsResource) ResourceName() string {
@@ -118,4 +119,3 @@ func (br *BaseAwsResource) IsNukable(identifier string) (bool, error) {
 
 	return true, nil
 }
-
