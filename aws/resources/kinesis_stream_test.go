@@ -8,33 +8,34 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/gruntwork-io/cloud-nuke/config"
+	"github.com/gruntwork-io/cloud-nuke/resource"
 	"github.com/stretchr/testify/require"
 )
 
-type mockedKinesisClient struct {
-	KinesisStreamsAPI
-	ListStreamsOutput  kinesis.ListStreamsOutput
-	DeleteStreamOutput kinesis.DeleteStreamOutput
+// mockKinesisStreamsClient implements KinesisStreamsAPI for testing.
+type mockKinesisStreamsClient struct {
+	ListStreamsOutput           kinesis.ListStreamsOutput
+	DeleteStreamOutput          kinesis.DeleteStreamOutput
+	DeleteStreamInput           *kinesis.DeleteStreamInput // Captures input for verification
+	DeleteStreamEnforceConsumer *bool
 }
 
-func (m mockedKinesisClient) ListStreams(ctx context.Context, params *kinesis.ListStreamsInput, optFns ...func(*kinesis.Options)) (*kinesis.ListStreamsOutput, error) {
+func (m *mockKinesisStreamsClient) ListStreams(ctx context.Context, params *kinesis.ListStreamsInput, optFns ...func(*kinesis.Options)) (*kinesis.ListStreamsOutput, error) {
 	return &m.ListStreamsOutput, nil
 }
 
-func (m mockedKinesisClient) DeleteStream(ctx context.Context, params *kinesis.DeleteStreamInput, optFns ...func(*kinesis.Options)) (*kinesis.DeleteStreamOutput, error) {
+func (m *mockKinesisStreamsClient) DeleteStream(ctx context.Context, params *kinesis.DeleteStreamInput, optFns ...func(*kinesis.Options)) (*kinesis.DeleteStreamOutput, error) {
+	m.DeleteStreamInput = params
+	m.DeleteStreamEnforceConsumer = params.EnforceConsumerDeletion
 	return &m.DeleteStreamOutput, nil
 }
 
 func TestKinesisStreams_GetAll(t *testing.T) {
 	t.Parallel()
 
-	testName1 := "stream1"
-	testName2 := "stream2"
-	ks := KinesisStreams{
-		Client: mockedKinesisClient{
-			ListStreamsOutput: kinesis.ListStreamsOutput{
-				StreamNames: []string{testName1, testName2},
-			},
+	mock := &mockKinesisStreamsClient{
+		ListStreamsOutput: kinesis.ListStreamsOutput{
+			StreamNames: []string{"stream-keep", "stream-skip"},
 		},
 	}
 
@@ -44,39 +45,36 @@ func TestKinesisStreams_GetAll(t *testing.T) {
 	}{
 		"emptyFilter": {
 			configObj: config.ResourceType{},
-			expected:  []string{testName1, testName2},
+			expected:  []string{"stream-keep", "stream-skip"},
 		},
 		"nameExclusionFilter": {
 			configObj: config.ResourceType{
 				ExcludeRule: config.FilterRule{
-					NamesRegExp: []config.Expression{{
-						RE: *regexp.MustCompile(testName1),
-					}}},
+					NamesRegExp: []config.Expression{{RE: *regexp.MustCompile("stream-skip")}},
+				},
 			},
-			expected: []string{testName2},
+			expected: []string{"stream-keep"},
 		},
 	}
+
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			names, err := ks.getAll(context.Background(), config.Config{
-				KinesisStream: tc.configObj,
-			})
+			names, err := listKinesisStreams(context.Background(), mock, resource.Scope{}, tc.configObj)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, aws.ToStringSlice(names))
 		})
 	}
-
 }
 
 func TestKinesisStreams_NukeAll(t *testing.T) {
 	t.Parallel()
 
-	ks := KinesisStreams{
-		Client: mockedKinesisClient{
-			DeleteStreamOutput: kinesis.DeleteStreamOutput{},
-		},
-	}
+	mock := &mockKinesisStreamsClient{}
 
-	err := ks.nukeAll([]*string{aws.String("test")})
+	err := deleteKinesisStream(context.Background(), mock, aws.String("test-stream"))
 	require.NoError(t, err)
+
+	// Verify EnforceConsumerDeletion is set to true
+	require.NotNil(t, mock.DeleteStreamEnforceConsumer)
+	require.True(t, *mock.DeleteStreamEnforceConsumer, "EnforceConsumerDeletion should be true to handle streams with consumers")
 }

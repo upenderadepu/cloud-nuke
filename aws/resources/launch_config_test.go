@@ -10,42 +10,41 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	"github.com/gruntwork-io/cloud-nuke/config"
+	"github.com/gruntwork-io/cloud-nuke/resource"
 	"github.com/stretchr/testify/require"
 )
 
-type mockedLaunchConfiguration struct {
-	LaunchConfigsAPI
+// mockLaunchConfigsClient implements LaunchConfigsAPI for testing.
+type mockLaunchConfigsClient struct {
 	DescribeLaunchConfigurationsOutput autoscaling.DescribeLaunchConfigurationsOutput
 	DeleteLaunchConfigurationOutput    autoscaling.DeleteLaunchConfigurationOutput
 }
 
-func (m mockedLaunchConfiguration) DescribeLaunchConfigurations(ctx context.Context, params *autoscaling.DescribeLaunchConfigurationsInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DescribeLaunchConfigurationsOutput, error) {
+func (m *mockLaunchConfigsClient) DescribeLaunchConfigurations(ctx context.Context, params *autoscaling.DescribeLaunchConfigurationsInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DescribeLaunchConfigurationsOutput, error) {
 	return &m.DescribeLaunchConfigurationsOutput, nil
 }
 
-func (m mockedLaunchConfiguration) DeleteLaunchConfiguration(ctx context.Context, params *autoscaling.DeleteLaunchConfigurationInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DeleteLaunchConfigurationOutput, error) {
+func (m *mockLaunchConfigsClient) DeleteLaunchConfiguration(ctx context.Context, params *autoscaling.DeleteLaunchConfigurationInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DeleteLaunchConfigurationOutput, error) {
 	return &m.DeleteLaunchConfigurationOutput, nil
 }
 
-func TestLaunchConfigurations_GetAll(t *testing.T) {
-
+func TestLaunchConfigs_GetAll(t *testing.T) {
 	t.Parallel()
 
-	testName1 := "test-launch-config1"
-	testName2 := "test-launch-config2"
+	testName1 := "test-lc-1"
+	testName2 := "test-lc-2"
 	now := time.Now()
-	lc := LaunchConfigs{
-		Client: mockedLaunchConfiguration{
-			DescribeLaunchConfigurationsOutput: autoscaling.DescribeLaunchConfigurationsOutput{
-				LaunchConfigurations: []types.LaunchConfiguration{
-					{
-						LaunchConfigurationName: aws.String(testName1),
-						CreatedTime:             aws.Time(now),
-					},
-					{
-						LaunchConfigurationName: aws.String(testName2),
-						CreatedTime:             aws.Time(now.Add(1)),
-					},
+
+	mock := &mockLaunchConfigsClient{
+		DescribeLaunchConfigurationsOutput: autoscaling.DescribeLaunchConfigurationsOutput{
+			LaunchConfigurations: []types.LaunchConfiguration{
+				{
+					LaunchConfigurationName: aws.String(testName1),
+					CreatedTime:             aws.Time(now),
+				},
+				{
+					LaunchConfigurationName: aws.String(testName2),
+					CreatedTime:             aws.Time(now.Add(1 * time.Hour)),
 				},
 			},
 		},
@@ -63,40 +62,38 @@ func TestLaunchConfigurations_GetAll(t *testing.T) {
 			configObj: config.ResourceType{
 				ExcludeRule: config.FilterRule{
 					NamesRegExp: []config.Expression{{
-						RE: *regexp.MustCompile(testName1),
-					}}},
+						RE: *regexp.MustCompile("test-lc-1"),
+					}},
+				},
 			},
 			expected: []string{testName2},
 		},
 		"timeAfterExclusionFilter": {
 			configObj: config.ResourceType{
 				ExcludeRule: config.FilterRule{
-					TimeAfter: aws.Time(now.Add(-1 * time.Hour)),
-				}},
-			expected: []string{},
+					TimeAfter: aws.Time(now.Add(30 * time.Minute)),
+				},
+			},
+			expected: []string{testName1},
 		},
 	}
+
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			names, err := lc.getAll(context.Background(), config.Config{
-				LaunchConfiguration: tc.configObj,
-			})
+			names, err := listLaunchConfigs(context.Background(), mock, resource.Scope{}, tc.configObj)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, aws.ToStringSlice(names))
 		})
 	}
 }
 
-func TestLaunchConfigurations_NukeAll(t *testing.T) {
-
+func TestLaunchConfigs_NukeAll(t *testing.T) {
 	t.Parallel()
 
-	lc := LaunchConfigs{
-		Client: mockedLaunchConfiguration{
-			DeleteLaunchConfigurationOutput: autoscaling.DeleteLaunchConfigurationOutput{},
-		},
+	mock := &mockLaunchConfigsClient{
+		DeleteLaunchConfigurationOutput: autoscaling.DeleteLaunchConfigurationOutput{},
 	}
 
-	err := lc.nukeAll([]*string{aws.String("test")})
+	err := deleteLaunchConfig(context.Background(), mock, aws.String("test-lc"))
 	require.NoError(t, err)
 }

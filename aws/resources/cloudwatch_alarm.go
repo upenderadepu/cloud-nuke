@@ -2,32 +2,56 @@ package resources
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/gruntwork-io/cloud-nuke/config"
 	"github.com/gruntwork-io/cloud-nuke/logging"
-	"github.com/gruntwork-io/cloud-nuke/report"
-	"github.com/gruntwork-io/cloud-nuke/util"
-	"github.com/gruntwork-io/go-commons/errors"
+	"github.com/gruntwork-io/cloud-nuke/resource"
 )
 
-func (cw *CloudWatchAlarms) getAll(c context.Context, configObj config.Config) ([]*string, error) {
-	var allAlarms []*string
-	input := &cloudwatch.DescribeAlarmsInput{
-		AlarmTypes: []types.AlarmType{types.AlarmTypeMetricAlarm, types.AlarmTypeCompositeAlarm},
-	}
+// CloudWatchAlarmsAPI defines the interface for CloudWatch Alarm operations.
+type CloudWatchAlarmsAPI interface {
+	DescribeAlarms(ctx context.Context, params *cloudwatch.DescribeAlarmsInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.DescribeAlarmsOutput, error)
+	DeleteAlarms(ctx context.Context, params *cloudwatch.DeleteAlarmsInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.DeleteAlarmsOutput, error)
+	PutCompositeAlarm(ctx context.Context, params *cloudwatch.PutCompositeAlarmInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.PutCompositeAlarmOutput, error)
+}
 
-	paginator := cloudwatch.NewDescribeAlarmsPaginator(cw.Client, input)
+// NewCloudWatchAlarms creates a new CloudWatch Alarms resource using the generic resource pattern.
+func NewCloudWatchAlarms() AwsResource {
+	return NewAwsResource(&resource.Resource[CloudWatchAlarmsAPI]{
+		ResourceTypeName: "cloudwatch-alarm",
+		BatchSize:        99,
+		InitClient: WrapAwsInitClient(func(r *resource.Resource[CloudWatchAlarmsAPI], cfg aws.Config) {
+			r.Scope.Region = cfg.Region
+			r.Client = cloudwatch.NewFromConfig(cfg)
+		}),
+		ConfigGetter: func(c config.Config) config.ResourceType {
+			return c.CloudWatchAlarm
+		},
+		Lister: listCloudWatchAlarms,
+		Nuker:  resource.SequentialDeleter(deleteCloudWatchAlarm),
+	})
+}
+
+// listCloudWatchAlarms retrieves all CloudWatch alarms that match the config filters.
+func listCloudWatchAlarms(ctx context.Context, client CloudWatchAlarmsAPI, scope resource.Scope, cfg config.ResourceType) ([]*string, error) {
+	var allAlarms []*string
+
+	paginator := cloudwatch.NewDescribeAlarmsPaginator(client, &cloudwatch.DescribeAlarmsInput{
+		AlarmTypes: []types.AlarmType{types.AlarmTypeMetricAlarm, types.AlarmTypeCompositeAlarm},
+	})
+
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(c)
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, errors.WithStackTrace(err)
+			return nil, err
 		}
 
 		for _, alarm := range page.MetricAlarms {
-			if configObj.CloudWatchAlarm.ShouldInclude(config.ResourceValue{
+			if cfg.ShouldInclude(config.ResourceValue{
 				Name: alarm.AlarmName,
 				Time: alarm.AlarmConfigurationUpdatedTimestamp,
 			}) {
@@ -36,7 +60,7 @@ func (cw *CloudWatchAlarms) getAll(c context.Context, configObj config.Config) (
 		}
 
 		for _, alarm := range page.CompositeAlarms {
-			if configObj.CloudWatchAlarm.ShouldInclude(config.ResourceValue{
+			if cfg.ShouldInclude(config.ResourceValue{
 				Name: alarm.AlarmName,
 				Time: alarm.AlarmConfigurationUpdatedTimestamp,
 			}) {
@@ -48,85 +72,35 @@ func (cw *CloudWatchAlarms) getAll(c context.Context, configObj config.Config) (
 	return allAlarms, nil
 }
 
-func (cw *CloudWatchAlarms) nukeAll(identifiers []*string) error {
-	if len(identifiers) == 0 {
-		logging.Debugf("No CloudWatch Alarms to nuke in region %s", cw.Region)
-		return nil
-	}
+// deleteCloudWatchAlarm deletes a single CloudWatch alarm.
+// For composite alarms, it first clears dependencies by setting the rule to FALSE.
+func deleteCloudWatchAlarm(ctx context.Context, client CloudWatchAlarmsAPI, id *string) error {
+	alarmName := aws.ToString(id)
 
-	// NOTE: we don't need to do pagination here, because the pagination is handled by the caller to this function,
-	// based on CloudWatchAlarm.MaxBatchSize, however we add a guard here to warn users when the batching fails and has a
-	// chance of throttling AWS. Since we concurrently make one call for each identifier, we pick 100 for the limit here
-	// because many APIs in AWS have a limit of 100 requests per second.
-	if len(identifiers) > 100 {
-		logging.Errorf("Nuking too many CloudWatch Alarms at once (100): halting to avoid hitting AWS API rate limiting")
-		return TooManyCloudWatchAlarmsErr{}
-	}
-
-	logging.Debugf("Deleting CloudWatch Alarms in region %s", cw.Region)
-
-	// If the alarm's type is composite alarm, remove the dependency by removing the rule.
-	alarms, err := cw.Client.DescribeAlarms(cw.Context, &cloudwatch.DescribeAlarmsInput{
-		AlarmTypes: []types.AlarmType{types.AlarmTypeMetricAlarm, types.AlarmTypeCompositeAlarm},
-		AlarmNames: aws.ToStringSlice(identifiers),
+	// Check if this is a composite alarm that needs dependency clearing
+	alarms, err := client.DescribeAlarms(ctx, &cloudwatch.DescribeAlarmsInput{
+		AlarmTypes: []types.AlarmType{types.AlarmTypeCompositeAlarm},
+		AlarmNames: []string{alarmName},
 	})
 	if err != nil {
-		logging.Debugf("[Failed] %s", err)
+		return fmt.Errorf("failed to describe alarm %s: %w", alarmName, err)
 	}
 
-	var compositeAlarmNames []*string
-	for _, compositeAlarm := range alarms.CompositeAlarms {
-		compositeAlarmNames = append(compositeAlarmNames, compositeAlarm.AlarmName)
-
-		_, err := cw.Client.PutCompositeAlarm(cw.Context, &cloudwatch.PutCompositeAlarmInput{
-			AlarmName: compositeAlarm.AlarmName,
+	// If it's a composite alarm, clear dependencies first
+	if len(alarms.CompositeAlarms) > 0 {
+		_, err = client.PutCompositeAlarm(ctx, &cloudwatch.PutCompositeAlarmInput{
+			AlarmName: id,
 			AlarmRule: aws.String("FALSE"),
 		})
 		if err != nil {
-			logging.Debugf("[Failed] %s", err)
+			logging.Debugf("[Warning] failed to clear composite alarm rule %s: %s", alarmName, err)
+			// Continue with deletion anyway - it might still work
 		}
-
-		// Note: for composite alarms, we need to delete one by one according to the documentation
-		// - https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_DeleteAlarms.html.
-		_, err = cw.Client.DeleteAlarms(cw.Context, &cloudwatch.DeleteAlarmsInput{
-			AlarmNames: []string{*compositeAlarm.AlarmName},
-		})
-
-		// Record status of this resource
-		report.Record(report.Entry{
-			Identifier:   aws.ToString(compositeAlarm.AlarmName),
-			ResourceType: "CloudWatch Alarm",
-			Error:        err,
-		})
 	}
 
-	nonCompositeAlarms := util.Difference(identifiers, compositeAlarmNames)
-	input := cloudwatch.DeleteAlarmsInput{AlarmNames: aws.ToStringSlice(nonCompositeAlarms)}
-	_, err = cw.Client.DeleteAlarms(cw.Context, &input)
-
-	// Record status of this resource
-	e := report.BatchEntry{
-		Identifiers:  aws.ToStringSlice(nonCompositeAlarms),
-		ResourceType: "CloudWatch Alarm",
-		Error:        err,
-	}
-	report.RecordBatch(e)
-
-	if err != nil {
-		logging.Debugf("[Failed] %s", err)
-		return errors.WithStackTrace(err)
-	}
-
-	for _, alarmName := range identifiers {
-		logging.Debugf("[OK] CloudWatch Alarm %s was deleted in %s", aws.ToString(alarmName), cw.Region)
-	}
-	return nil
-}
-
-// Custom errors
-
-type TooManyCloudWatchAlarmsErr struct{}
-
-func (err TooManyCloudWatchAlarmsErr) Error() string {
-	return "Too many CloudWatch Alarms requested at once."
+	// Delete the alarm
+	_, err = client.DeleteAlarms(ctx, &cloudwatch.DeleteAlarmsInput{
+		AlarmNames: []string{alarmName},
+	})
+	return err
 }

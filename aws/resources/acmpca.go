@@ -3,32 +3,59 @@ package resources
 import (
 	"context"
 	"fmt"
-	"sync"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acmpca"
 	"github.com/aws/aws-sdk-go-v2/service/acmpca/types"
 	"github.com/gruntwork-io/cloud-nuke/config"
 	"github.com/gruntwork-io/cloud-nuke/logging"
-	"github.com/gruntwork-io/cloud-nuke/report"
-	"github.com/gruntwork-io/go-commons/errors"
-	"github.com/hashicorp/go-multierror"
+	"github.com/gruntwork-io/cloud-nuke/resource"
 )
 
-// GetAll returns a list of all arn's of ACMPCA, which can be deleted.
-func (ap *ACMPCA) getAll(c context.Context, configObj config.Config) ([]*string, error) {
+const (
+	// permanentDeletionDays is the number of days before a CA is permanently deleted.
+	// AWS allows 7-30 days; we use the minimum since cloud-nuke targets non-production resources.
+	permanentDeletionDays = 7
+)
+
+// ACMPCAAPI defines the interface for ACM PCA operations.
+type ACMPCAAPI interface {
+	DeleteCertificateAuthority(ctx context.Context, params *acmpca.DeleteCertificateAuthorityInput, optFns ...func(*acmpca.Options)) (*acmpca.DeleteCertificateAuthorityOutput, error)
+	DescribeCertificateAuthority(ctx context.Context, params *acmpca.DescribeCertificateAuthorityInput, optFns ...func(*acmpca.Options)) (*acmpca.DescribeCertificateAuthorityOutput, error)
+	ListCertificateAuthorities(ctx context.Context, params *acmpca.ListCertificateAuthoritiesInput, optFns ...func(*acmpca.Options)) (*acmpca.ListCertificateAuthoritiesOutput, error)
+	UpdateCertificateAuthority(ctx context.Context, params *acmpca.UpdateCertificateAuthorityInput, optFns ...func(*acmpca.Options)) (*acmpca.UpdateCertificateAuthorityOutput, error)
+}
+
+// NewACMPCA creates a new ACMPCA resource using the generic resource pattern.
+func NewACMPCA() AwsResource {
+	return NewAwsResource(&resource.Resource[ACMPCAAPI]{
+		ResourceTypeName: "acmpca",
+		BatchSize:        10,
+		InitClient: WrapAwsInitClient(func(r *resource.Resource[ACMPCAAPI], cfg aws.Config) {
+			r.Scope.Region = cfg.Region
+			r.Client = acmpca.NewFromConfig(cfg)
+		}),
+		ConfigGetter: func(c config.Config) config.ResourceType {
+			return c.ACMPCA
+		},
+		Lister: listACMPCA,
+		Nuker:  resource.SimpleBatchDeleter(deleteACMPCA),
+	})
+}
+
+// listACMPCA retrieves all ACM PCA certificate authorities that match the config filters.
+func listACMPCA(ctx context.Context, client ACMPCAAPI, scope resource.Scope, cfg config.ResourceType) ([]*string, error) {
 	var arns []*string
 
-	paginator := acmpca.NewListCertificateAuthoritiesPaginator(ap.Client, &acmpca.ListCertificateAuthoritiesInput{})
+	paginator := acmpca.NewListCertificateAuthoritiesPaginator(client, &acmpca.ListCertificateAuthoritiesInput{})
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(c)
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, errors.WithStackTrace(err)
+			return nil, err
 		}
 
 		for _, ca := range page.CertificateAuthorities {
-			if ap.shouldInclude(ca, configObj) {
+			if shouldIncludeACMPCA(ca, cfg) {
 				arns = append(arns, ca.Arn)
 			}
 		}
@@ -37,116 +64,78 @@ func (ap *ACMPCA) getAll(c context.Context, configObj config.Config) ([]*string,
 	return arns, nil
 }
 
-func (ap *ACMPCA) shouldInclude(ca types.CertificateAuthority, configObj config.Config) bool {
-	statusSafe := ca.Status
-	if statusSafe == types.CertificateAuthorityStatusDeleted {
+// shouldIncludeACMPCA determines if an ACM PCA should be included based on config filters.
+func shouldIncludeACMPCA(ca types.CertificateAuthority, cfg config.ResourceType) bool {
+	if ca.Status == types.CertificateAuthorityStatusDeleted {
 		return false
 	}
 
-	// reference time for excludeAfter is lastStateChangeAt time,
-	// unless it was never changed and createAt time is used.
-	var referenceTime time.Time
+	// Use LastStateChangeAt as the reference time for time-based filters.
+	// Fall back to CreatedAt if the CA state was never changed.
+	referenceTime := aws.ToTime(ca.LastStateChangeAt)
 	if ca.LastStateChangeAt == nil {
 		referenceTime = aws.ToTime(ca.CreatedAt)
-	} else {
-		referenceTime = aws.ToTime(ca.LastStateChangeAt)
 	}
 
-	return configObj.ACMPCA.ShouldInclude(config.ResourceValue{Time: &referenceTime})
+	return cfg.ShouldInclude(config.ResourceValue{Time: &referenceTime})
 }
 
-// nukeAll will delete all ACMPCA, which are given by a list of arn's.
-func (ap *ACMPCA) nukeAll(arns []*string) error {
-	if len(arns) == 0 {
-		logging.Debugf("No ACMPCA to nuke in region %s", ap.Region)
-		return nil
-	}
+// deleteACMPCA deletes a single ACM PCA certificate authority.
+// This function handles the multi-step deletion process:
+// 1. Describe the CA to get its current status
+// 2. Disable the CA if it's in ACTIVE state (AWS requires this before deletion)
+// 3. Delete the CA with a 7-day restoration period
+func deleteACMPCA(ctx context.Context, client ACMPCAAPI, arn *string) error {
+	arnStr := aws.ToString(arn)
 
-	logging.Debugf("Deleting all ACMPCA in region %s", ap.Region)
-	// There is no bulk delete acmpca API, so we delete the batch of ARNs concurrently using go routines.
-	wg := new(sync.WaitGroup)
-	wg.Add(len(arns))
-	errChans := make([]chan error, len(arns))
-	for i, arn := range arns {
-		errChans[i] = make(chan error, 1)
-		go ap.deleteAsync(wg, errChans[i], arn)
-	}
-	wg.Wait()
-
-	// Collect all the errors from the async delete calls into a single error struct.
-	var allErrs *multierror.Error
-	for _, errChan := range errChans {
-		if err := <-errChan; err != nil {
-			allErrs = multierror.Append(allErrs, err)
-			logging.Errorf("[Failed] %s", err)
-		}
-	}
-
-	return errors.WithStackTrace(allErrs.ErrorOrNil())
-}
-
-// deleteAsync deletes the provided ACMPCA arn. Intended to be run in a goroutine, using wait groups
-// and a return channel for errors.
-func (ap *ACMPCA) deleteAsync(wg *sync.WaitGroup, errChan chan error, arn *string) {
-	defer wg.Done()
-
-	logging.Debugf("Fetching details of CA to be deleted for ACMPCA %s in region %s", *arn, ap.Region)
-	details, detailsErr := ap.Client.DescribeCertificateAuthority(
-		ap.Context,
-		&acmpca.DescribeCertificateAuthorityInput{CertificateAuthorityArn: arn})
-	if detailsErr != nil {
-		errChan <- detailsErr
-		return
+	logging.Debugf("Fetching CA details for ACMPCA %s", arnStr)
+	details, err := client.DescribeCertificateAuthority(ctx, &acmpca.DescribeCertificateAuthorityInput{
+		CertificateAuthorityArn: arn,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe ACMPCA %s: %w", arnStr, err)
 	}
 	if details.CertificateAuthority == nil {
-		errChan <- fmt.Errorf("could not find CA %s", aws.ToString(arn))
-		return
+		return fmt.Errorf("CA not found: %s", arnStr)
 	}
 	if details.CertificateAuthority.Status == "" {
-		errChan <- fmt.Errorf("could not fetch status for CA %s", aws.ToString(arn))
-		return
+		return fmt.Errorf("CA status unavailable: %s", arnStr)
 	}
 
-	// find out, whether we have to disable the CA first, prior to deletion.
-	statusSafe := details.CertificateAuthority.Status
-	shouldUpdateStatus := statusSafe != types.CertificateAuthorityStatusCreating &&
-		statusSafe != types.CertificateAuthorityStatusPendingCertificate &&
-		statusSafe != types.CertificateAuthorityStatusDisabled &&
-		statusSafe != types.CertificateAuthorityStatusDeleted
-
-	if shouldUpdateStatus {
-		logging.Debugf("Setting status to 'DISABLED' for ACMPCA %s in region %s", *arn, ap.Region)
-		if _, updateStatusErr := ap.Client.UpdateCertificateAuthority(ap.Context, &acmpca.UpdateCertificateAuthorityInput{
+	// AWS requires ACTIVE CAs to be disabled before deletion.
+	// CAs in CREATING, PENDING_CERTIFICATE, DISABLED, or DELETED states can be deleted directly.
+	if needsDisableBeforeDelete(details.CertificateAuthority.Status) {
+		logging.Debugf("Disabling ACMPCA %s before deletion", arnStr)
+		if _, err = client.UpdateCertificateAuthority(ctx, &acmpca.UpdateCertificateAuthorityInput{
 			CertificateAuthorityArn: arn,
 			Status:                  types.CertificateAuthorityStatusDisabled,
-		}); updateStatusErr != nil {
-			errChan <- updateStatusErr
-			return
+		}); err != nil {
+			return fmt.Errorf("failed to disable ACMPCA %s: %w", arnStr, err)
 		}
-
-		logging.Debugf("Did set status to 'DISABLED' for ACMPCA: %s in region %s", *arn, ap.Region)
 	}
 
-	_, deleteErr := ap.Client.DeleteCertificateAuthority(ap.Context, &acmpca.DeleteCertificateAuthorityInput{
-		CertificateAuthorityArn: arn,
-		// the range is 7 to 30 days.
-		// since cloud-nuke should not be used in production,
-		// we assume that the minimum (7 days) is fine.
-		PermanentDeletionTimeInDays: aws.Int32(7),
+	_, err = client.DeleteCertificateAuthority(ctx, &acmpca.DeleteCertificateAuthorityInput{
+		CertificateAuthorityArn:     arn,
+		PermanentDeletionTimeInDays: aws.Int32(permanentDeletionDays),
 	})
-
-	// Record status of this resource
-	e := report.Entry{
-		Identifier:   aws.ToString(arn),
-		ResourceType: "ACM Private CA (ACMPCA)",
-		Error:        deleteErr,
+	if err != nil {
+		return fmt.Errorf("failed to delete ACMPCA %s: %w", arnStr, err)
 	}
-	report.Record(e)
 
-	if deleteErr != nil {
-		errChan <- deleteErr
-		return
+	logging.Debugf("Deleted ACMPCA: %s", arnStr)
+	return nil
+}
+
+// needsDisableBeforeDelete returns true if the CA must be disabled before deletion.
+func needsDisableBeforeDelete(status types.CertificateAuthorityStatus) bool {
+	switch status {
+	case types.CertificateAuthorityStatusCreating,
+		types.CertificateAuthorityStatusPendingCertificate,
+		types.CertificateAuthorityStatusDisabled,
+		types.CertificateAuthorityStatusDeleted:
+		return false
+	default:
+		// ACTIVE, EXPIRED, FAILED states require disable first
+		return true
 	}
-	logging.Debugf("Deleted ACMPCA: %s successfully", *arn)
-	errChan <- nil
 }

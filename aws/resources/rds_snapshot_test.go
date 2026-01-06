@@ -10,43 +10,40 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/gruntwork-io/cloud-nuke/config"
-	"github.com/stretchr/testify/assert"
+	"github.com/gruntwork-io/cloud-nuke/resource"
 	"github.com/stretchr/testify/require"
 )
 
-type mockedRdsSnapshot struct {
-	RdsSnapshotAPI
-	DescribeDBSnapshotsPagesOutput rds.DescribeDBSnapshotsOutput
-	DeleteDBSnapshotOutput         rds.DeleteDBSnapshotOutput
+type mockRdsSnapshotClient struct {
+	DescribeDBSnapshotsOutput rds.DescribeDBSnapshotsOutput
+	DeleteDBSnapshotOutput    rds.DeleteDBSnapshotOutput
 }
 
-func (m mockedRdsSnapshot) DescribeDBSnapshots(ctx context.Context, params *rds.DescribeDBSnapshotsInput, optFns ...func(*rds.Options)) (*rds.DescribeDBSnapshotsOutput, error) {
-	return &m.DescribeDBSnapshotsPagesOutput, nil
+func (m *mockRdsSnapshotClient) DescribeDBSnapshots(ctx context.Context, params *rds.DescribeDBSnapshotsInput, optFns ...func(*rds.Options)) (*rds.DescribeDBSnapshotsOutput, error) {
+	return &m.DescribeDBSnapshotsOutput, nil
 }
 
-func (m mockedRdsSnapshot) DeleteDBSnapshot(ctx context.Context, params *rds.DeleteDBSnapshotInput, optFns ...func(*rds.Options)) (*rds.DeleteDBSnapshotOutput, error) {
+func (m *mockRdsSnapshotClient) DeleteDBSnapshot(ctx context.Context, params *rds.DeleteDBSnapshotInput, optFns ...func(*rds.Options)) (*rds.DeleteDBSnapshotOutput, error) {
 	return &m.DeleteDBSnapshotOutput, nil
 }
 
-func TestRdsSnapshot_GetAll(t *testing.T) {
-
+func TestListRdsSnapshots(t *testing.T) {
 	t.Parallel()
 
 	testName1 := "test-name1"
 	testName2 := "test-name2"
 	now := time.Now()
-	snapshot := RdsSnapshot{
-		Client: mockedRdsSnapshot{
-			DescribeDBSnapshotsPagesOutput: rds.DescribeDBSnapshotsOutput{
-				DBSnapshots: []types.DBSnapshot{
-					{
-						DBSnapshotIdentifier: &testName1,
-						SnapshotCreateTime:   &now,
-					},
-					{
-						DBSnapshotIdentifier: &testName2,
-						SnapshotCreateTime:   aws.Time(now.Add(1)),
-					},
+
+	mock := &mockRdsSnapshotClient{
+		DescribeDBSnapshotsOutput: rds.DescribeDBSnapshotsOutput{
+			DBSnapshots: []types.DBSnapshot{
+				{
+					DBSnapshotIdentifier: aws.String(testName1),
+					SnapshotCreateTime:   aws.Time(now),
+				},
+				{
+					DBSnapshotIdentifier: aws.String(testName2),
+					SnapshotCreateTime:   aws.Time(now.Add(1 * time.Hour)),
 				},
 			},
 		},
@@ -63,9 +60,8 @@ func TestRdsSnapshot_GetAll(t *testing.T) {
 		"nameExclusionFilter": {
 			configObj: config.ResourceType{
 				ExcludeRule: config.FilterRule{
-					NamesRegExp: []config.Expression{{
-						RE: *regexp.MustCompile(testName1),
-					}}},
+					NamesRegExp: []config.Expression{{RE: *regexp.MustCompile(testName1)}},
+				},
 			},
 			expected: []string{testName2},
 		},
@@ -73,32 +69,25 @@ func TestRdsSnapshot_GetAll(t *testing.T) {
 			configObj: config.ResourceType{
 				ExcludeRule: config.FilterRule{
 					TimeAfter: aws.Time(now.Add(-1 * time.Hour)),
-				}},
+				},
+			},
 			expected: []string{},
 		},
 	}
+
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			names, err := snapshot.getAll(context.Background(), config.Config{
-				RdsSnapshot: tc.configObj,
-			})
+			names, err := listRdsSnapshots(context.Background(), mock, resource.Scope{}, tc.configObj)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, aws.ToStringSlice(names))
 		})
 	}
 }
 
-func TestRdsSnapshot_NukeAll(t *testing.T) {
-
+func TestDeleteRdsSnapshot(t *testing.T) {
 	t.Parallel()
 
-	testName := "test-db-cluster"
-	snapshot := RdsSnapshot{
-		Client: mockedRdsSnapshot{
-			DeleteDBSnapshotOutput: rds.DeleteDBSnapshotOutput{},
-		},
-	}
-
-	err := snapshot.nukeAll([]*string{&testName})
-	assert.NoError(t, err)
+	mock := &mockRdsSnapshotClient{}
+	err := deleteRdsSnapshot(context.Background(), mock, aws.String("test-snapshot"))
+	require.NoError(t, err)
 }

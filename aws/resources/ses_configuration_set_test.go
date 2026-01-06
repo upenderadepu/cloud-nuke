@@ -9,13 +9,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ses"
 	"github.com/aws/aws-sdk-go-v2/service/ses/types"
 	"github.com/gruntwork-io/cloud-nuke/config"
+	"github.com/gruntwork-io/cloud-nuke/resource"
 	"github.com/stretchr/testify/require"
 )
 
 type mockedSesConfigurationSet struct {
-	SESConfigurationSet
-	DeleteConfigurationSetOutput ses.DeleteConfigurationSetOutput
-	ListConfigurationSetsOutput  ses.ListConfigurationSetsOutput
+	SesConfigurationSetAPI
+	ListConfigurationSetsOutput ses.ListConfigurationSetsOutput
 }
 
 func (m mockedSesConfigurationSet) ListConfigurationSets(ctx context.Context, params *ses.ListConfigurationSetsInput, optFns ...func(*ses.Options)) (*ses.ListConfigurationSetsOutput, error) {
@@ -23,30 +23,17 @@ func (m mockedSesConfigurationSet) ListConfigurationSets(ctx context.Context, pa
 }
 
 func (m mockedSesConfigurationSet) DeleteConfigurationSet(ctx context.Context, params *ses.DeleteConfigurationSetInput, optFns ...func(*ses.Options)) (*ses.DeleteConfigurationSetOutput, error) {
-	return &m.DeleteConfigurationSetOutput, nil
+	return &ses.DeleteConfigurationSetOutput{}, nil
 }
-
-var (
-	id1                = "test-id-1"
-	id2                = "test-id-2"
-	configurationsSet1 = types.ConfigurationSet{
-		Name: aws.String(id1),
-	}
-	configurationsSet2 = types.ConfigurationSet{
-		Name: aws.String(id2),
-	}
-)
 
 func TestSesConfigurationSet_GetAll(t *testing.T) {
 	t.Parallel()
 
-	identity := SesConfigurationSet{
-		Client: mockedSesConfigurationSet{
-			ListConfigurationSetsOutput: ses.ListConfigurationSetsOutput{
-				ConfigurationSets: []types.ConfigurationSet{
-					configurationsSet1,
-					configurationsSet2,
-				},
+	mock := mockedSesConfigurationSet{
+		ListConfigurationSetsOutput: ses.ListConfigurationSetsOutput{
+			ConfigurationSets: []types.ConfigurationSet{
+				{Name: aws.String("config-set-1")},
+				{Name: aws.String("config-set-2")},
 			},
 		},
 	}
@@ -57,23 +44,33 @@ func TestSesConfigurationSet_GetAll(t *testing.T) {
 	}{
 		"emptyFilter": {
 			configObj: config.ResourceType{},
-			expected:  []string{id1, id2},
+			expected:  []string{"config-set-1", "config-set-2"},
 		},
 		"nameExclusionFilter": {
 			configObj: config.ResourceType{
 				ExcludeRule: config.FilterRule{
 					NamesRegExp: []config.Expression{{
-						RE: *regexp.MustCompile(id2),
-					}}},
+						RE: *regexp.MustCompile("config-set-1"),
+					}},
+				},
 			},
-			expected: []string{id1},
+			expected: []string{"config-set-2"},
+		},
+		"nameInclusionFilter": {
+			configObj: config.ResourceType{
+				IncludeRule: config.FilterRule{
+					NamesRegExp: []config.Expression{{
+						RE: *regexp.MustCompile("config-set-1"),
+					}},
+				},
+			},
+			expected: []string{"config-set-1"},
 		},
 	}
+
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			names, err := identity.getAll(context.Background(), config.Config{
-				SESConfigurationSet: tc.configObj,
-			})
+			names, err := listSesConfigurationSets(context.Background(), mock, resource.Scope{}, tc.configObj)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, aws.ToStringSlice(names))
 		})
@@ -83,10 +80,7 @@ func TestSesConfigurationSet_GetAll(t *testing.T) {
 func TestSesConfigurationSet_NukeAll(t *testing.T) {
 	t.Parallel()
 
-	identity := SesConfigurationSet{
-		Client: mockedSesConfigurationSet{},
-	}
-
-	err := identity.nukeAll([]*string{aws.String("test")})
+	mock := mockedSesConfigurationSet{}
+	err := deleteSesConfigurationSet(context.Background(), mock, aws.String("test-config-set"))
 	require.NoError(t, err)
 }
